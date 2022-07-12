@@ -1,0 +1,23 @@
+mqtt:
+  sensor:
+    - name: "Electric meter peak consumption"
+      device_class: "energy"
+      state_topic: "electricMeter/1.8.1/#"
+      state_class: "total"
+      unit_of_measurement: "kWh"
+    - name: "Electric meter off peak consumption"
+      device_class: "energy"
+      state_topic: "electricMeter/1.8.2/#"
+      state_class: "total"
+      unit_of_measurement: "kWh"
+    - name: "Electric meter peak injection"
+      device_class: "energy"
+      state_topic: "electricMeter/2.8.1/#"
+      state_class: "total"
+      unit_of_measurement: "kWh"
+    - name: "Electric meter off peak injection"
+      device_class: "energy"
+      state_topic: "electricMeter/2.8.2/#"
+      state_class: "total"
+      unit_of_measurement: "kWh"
+
