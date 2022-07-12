@@ -5,14 +5,19 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
 #include <ESP8266WebServer.h>
+#include <ArduinoMqttClient.h>
 #include <cerrno>
 
 
 // Set Wifi settings here
-#define WLANSSID "iPhone 11"
-#define WLANPWD "iphAntoine"
-//#define WLANSSID "WiFi-2.4-8876"
-//r#define WLANPWD "wwcd92ppr6n4m"
+#define WLANSSID ""
+#define WLANPWD ""
+
+WiFiClient wifiClient;
+MqttClient mqttClient(wifiClient);
+
+const char broker[] = "192.168.1.35";
+int        port     = 1883;
 
 // Set the amount of debugging detail
 #define DEBUG_LEVEL 3
@@ -30,19 +35,11 @@
 #define FAILED_WIFI_RESET 10
 #define FAILED_METER_CONNECT_RESET 15
 
-// The values below should be filled in if using a static IP
-
-// IPAddress staticIP(192, 168, 0, xx);
-// IPAddress gateway(192, 168, 0, xx);
-// IPAddress dns(xx, xx, xx, xx);
-// IPAddress subnet(255, 255, 255, 0);
-
 
 #define MAXLINELENGTH 128 // longest normal line is 47 char (+3 for \r\n\0)
 char dataline[MAXLINELENGTH];
 
-// For valid telegram, whether to check gas reading and phase current/voltages
-#define CHECK_GAS false
+// For valid telegram, whether to check phase current/voltages
 #define CHECK_PHASE_INFO false
 
 struct EnergyDataSmall: public Printable {
@@ -52,15 +49,12 @@ struct EnergyDataSmall: public Printable {
     r += p.printf("Tarif: %s, timestamp: %s", isPeak?"peak":"off peak", validTimestamp?asctime(&timestamp): "null\n");
     r += p.printf("Consumption: peak: %.3f, off peak: %.3f\n", peakConsumption, offPeakConsumption);
     r += p.printf("Injection: peak: %.3f, off peak: %.3f\n", peakInjection, offPeakInjection);
-    r += p.printf("Gas timestamp: %s", validGasTimestamp?asctime(&gasTimestamp): "null\n");
-    r += p.printf("Gas consumption: %.4f\n", gasConsumption);    
     return r;
   }
 
-  bool isValid(bool checkGas) const {
+  bool isValid() const {
     bool ch1=validTimestamp&&peakConsumption>=0.0&&offPeakConsumption>=0.0&&peakInjection>=0.0&&offPeakInjection>=0.0;
-    bool ch2=gasConsumption>=0.0&&validGasTimestamp;
-    return ch1&&(ch2||!checkGas);
+    return ch1;
   }
 
   void writeReferenceDataSPIFFS() {
@@ -68,13 +62,11 @@ struct EnergyDataSmall: public Printable {
       File dataFile = SPIFFS.open("/refdata", "w");
       if(dataFile) {
         DEBUG_OUT(2, "Writing reference data to SPIFFS\n");
-        dataFile.printf("%04d%02d%02d%02d%02d%02d\n%04d%02d%02d%02d%02d%02d\n%.3f\n%.3f\n%.3f\n%.3f\n%.4f\n",
+        dataFile.printf("%04d%02d%02d%02d%02d%02d\n%.3f\n%.3f\n%.3f\n%.3f\n",
         timestamp.tm_year, timestamp.tm_mon, timestamp.tm_mday,
         timestamp.tm_hour, timestamp.tm_min, timestamp.tm_sec,
-        gasTimestamp.tm_year, gasTimestamp.tm_mon, gasTimestamp.tm_mday,
-        gasTimestamp.tm_hour, gasTimestamp.tm_min, gasTimestamp.tm_sec,
         peakConsumption, offPeakConsumption, 
-        peakInjection, offPeakInjection, gasConsumption);
+        peakInjection, offPeakInjection);
         dataFile.close();
       } else {
         DEBUG_OUT(0, "Failed to open data file for writing\n");
@@ -91,13 +83,11 @@ struct EnergyDataSmall: public Printable {
       if(dataFile) {
         char dataline[20];
         if(dataFile.available()) validTimestamp=readDateFromFile(dataFile, dataline, "%04d%02d%02d%02d%02d%02d", &timestamp);
-        if(dataFile.available()) validGasTimestamp=readDateFromFile(dataFile, dataline, "%04d%02d%02d%02d%02d%02d", &gasTimestamp);
         if(dataFile.available()) readValueFromFile(dataFile, dataline, "%lf", &peakConsumption);
         if(dataFile.available()) readValueFromFile(dataFile, dataline, "%lf", &offPeakConsumption);
         if(dataFile.available()) readValueFromFile(dataFile, dataline, "%lf", &peakInjection);
         if(dataFile.available()) readValueFromFile(dataFile, dataline, "%lf", &offPeakInjection);
-        if(dataFile.available()) readValueFromFile(dataFile, dataline, "%lf", &gasConsumption);
-        DEBUG_OUT(2, "Reading reference data to SPIFFS, valid: %s\n", isValid(CHECK_GAS)?"true":"false");
+        DEBUG_OUT(2, "Reading reference data to SPIFFS, valid: %s\n", isValid()?"true":"false");
       } else {
         DEBUG_OUT(0, "Data file does not exist\n");
       }
@@ -130,22 +120,17 @@ struct EnergyDataSmall: public Printable {
   double peakInjection=-1.0;
   double offPeakInjection=-1.0;
 
-  double gasConsumption=-1.0; 
-
   tm timestamp;
   bool validTimestamp=false;
-
-  tm gasTimestamp;
-  bool validGasTimestamp=false;
   
 };
 
 
 struct EnergyData: public EnergyDataSmall {
-  bool isValid(bool checkGas=true, bool checkPhaseInfo=false) {
+  bool isValid(bool checkPhaseInfo=false) {
     bool ch1=currentConsumption>=0.0&&currentInjection>=0.0;
     bool ch2=phase1Voltage>=0.0&&phase2Voltage>=0.0&&phase3Voltage>=0.0&&phase1Current>=0.0&&phase2Current>=0.0&&phase3Current>=0.0;
-    return EnergyDataSmall::isValid(checkGas)&&ch1&&(ch2||!checkPhaseInfo);
+    return EnergyDataSmall::isValid()&&ch1&&(ch2||!checkPhaseInfo);
   }
 
   size_t printTo(Print& p) const {
@@ -155,6 +140,38 @@ struct EnergyData: public EnergyDataSmall {
     r += p.printf("Phase current: %.0f, %.0f, %.0f\n", phase1Current, phase2Current, phase3Current);
     return r;
   }
+
+  void sendMQTT() {
+    /* 
+    handleMeterTag(dataline, "1-0:1.8.1", result.peakConsumption);
+    handleMeterTag(dataline, "1-0:1.8.2", result.offPeakConsumption);
+    handleMeterTag(dataline, "1-0:2.8.1", result.peakInjection);
+    handleMeterTag(dataline, "1-0:2.8.2", result.offPeakInjection);
+    */
+    char topic181[] = "electricMeter/1.8.1";
+    char topic182[] = "electricMeter/1.8.2";
+    char topic281[] = "electricMeter/2.8.1";
+    char topic282[] = "electricMeter/2.8.2";
+
+    if (mqttClient.connected()) {
+      mqttClient.beginMessage(topic181);
+      mqttClient.print(peakConsumption);
+      mqttClient.endMessage();
+
+      mqttClient.beginMessage(topic182);
+      mqttClient.print(offPeakConsumption);
+      mqttClient.endMessage();
+
+      mqttClient.beginMessage(topic281);
+      mqttClient.print(peakInjection);
+      mqttClient.endMessage();
+
+      mqttClient.beginMessage(topic282);
+      mqttClient.print(offPeakInjection);
+      mqttClient.endMessage();
+    }
+  }
+  
   double currentConsumption=-1.0;
   double currentInjection=-1.0;
 
@@ -203,13 +220,15 @@ void setup() {
   // Read reference data from SPIFFS
 
   referenceData.readReferenceDataSPIFFS();
-  DEBUG_OUT(2, "Reference data valid: %s\n", referenceData.isValid(CHECK_GAS)?"true":"false");
+  DEBUG_OUT(2, "Reference data valid: %s\n", referenceData.isValid()?"true":"false");
 
   // Setup web server
   webServer.on("/", serveHtmlPage);
   webServer.onNotFound(serveHtmlPage);
-
   webServer.begin();
+
+  // Setup MQTT client
+  mqttClient.connect(broker, port);
   
   DEBUG_OUT(2, "Setup finished\n");
 }
@@ -288,7 +307,6 @@ bool readTelegram(EnergyData& result, unsigned long  timeOut, bool checkCRC) {
     bool telegramStarted=false;
     unsigned int currentCRC=0;
     while(Serial.available()) {
-      DEBUG_OUT(2, "locked 2\n");
       memset(dataline, 0, sizeof(dataline));
       int len = Serial.readBytesUntil('\n', dataline, MAXLINELENGTH);
       dataline[len] = '\n';
@@ -339,14 +357,11 @@ bool readTelegram(EnergyData& result, unsigned long  timeOut, bool checkCRC) {
         handleMeterTag(dataline, "1-0:31.7.0", result.phase1Current);
         handleMeterTag(dataline, "1-0:51.7.0", result.phase2Current);
         handleMeterTag(dataline, "1-0:71.7.0", result.phase3Current);
-        
-        // Gas tag is 0-1:24.2.1 for some meters and 0-1:24.2.3 for others
-        handleDateValue(dataline, "0-1:24.2", result.gasTimestamp, result.validGasTimestamp);
-        handleMeterTag(dataline, "0-1:24.2", result.gasConsumption);
       }
     }
     delay(500);
   }
+  return false;
 }
 
 unsigned int CRC16(unsigned int crc, unsigned char *buf, int len) {
@@ -370,7 +385,6 @@ void loop() {
 
   unsigned long currentTime=millis();
   if(currentTime-lastUpdateTime>UPDATE_INTERVAL) {
-      DEBUG_OUT(2, "Update interval\n");
       if(currentTime<lastUpdateTime) {
         // unsigned long has rolled over, congratulations device is running for 49 days
         uptimeEpoch++;
@@ -378,21 +392,21 @@ void loop() {
       lastUpdateTime=currentTime;
       EnergyData newData=EnergyData();
       readTelegram(newData, 5000, false);
-      bool newValid=newData.isValid(CHECK_GAS, CHECK_PHASE_INFO);
+      bool newValid=newData.isValid(CHECK_PHASE_INFO);
       DEBUG_OUT(2, "Telegram valid: %s\n", newValid?"true":"false");
       if(newValid) {
         failedMeterConnectConsecutive=0;
         currentData=newData;
-        if(referenceData.isValid(CHECK_GAS)) {
+        if(referenceData.isValid()) {
           // If we started a new day, previous data becomes the new reference
           DEBUG_OUT(2, "Valid referenceData\n");
-          if(previousData.isValid(CHECK_GAS)&&currentData.timestamp.tm_mday!=previousData.timestamp.tm_mday) {
+          if(previousData.isValid()&&currentData.timestamp.tm_mday!=previousData.timestamp.tm_mday) {
             DEBUG_OUT(1, "New day, updating reference data\n");
             referenceData=previousData;
             referenceData.writeReferenceDataSPIFFS();
           }
   
-          if(previousData.isValid(false)&&currentData.timestamp.tm_min/15!=previousData.timestamp.tm_min/15) {
+          if(previousData.isValid()&&currentData.timestamp.tm_min/15!=previousData.timestamp.tm_min/15) {
             DEBUG_OUT(1, "Started new quarter of an hour\n");
             referenceData15=previousData;
           }
@@ -401,6 +415,7 @@ void loop() {
             lastSendTime=currentTime;
             webServer.handleClient();
             yield();
+            currentData.sendMQTT();
   
             char electricityData[130];
             sprintf(electricityData,
@@ -418,27 +433,6 @@ void loop() {
             // TODO
             DEBUG_OUT(3, "%s", electricityData);
   
-          }
-  
-          // Check whether we have a new gas measurement
-  
-          if(currentData.validGasTimestamp&&currentData.gasConsumption>=0.0) {
-            time_t prevTime=mktime(&previousData.gasTimestamp);
-            time_t currTime=mktime(&currentData.gasTimestamp);
-      
-            DEBUG_OUT(2, "Gas timestamp previous, valid: %s, %s", previousData.validGasTimestamp?"true":"false", asctime(&previousData.gasTimestamp)); 
-            DEBUG_OUT(2, "Gas timestamp current: %s", asctime(&currentData.gasTimestamp)); 
-      
-            if(!previousData.validGasTimestamp||currTime>prevTime) {
-              DEBUG_OUT(2, "New gas measurement, timestamp:%s\n", asctime(&currentData.gasTimestamp));
-              char gasData[30];
-              sprintf(gasData,
-              "[{\"delta_t\":\"0\","
-              "\"field7\":\"%.4f\"}]",
-              currentData.gasConsumption-referenceData.gasConsumption);
-              // Send data here
-              // TODO
-             }
           }
         } else {
           // There is no beginning of the day reference yet, current data becomes the reference, this happens at startup
@@ -466,6 +460,11 @@ void loop() {
   if(WiFi.status()==WL_CONNECTED) {
     failedWifiConsecutive=0;
     webServer.handleClient();
+
+    if (!mqttClient.connected()) {
+      DEBUG_OUT(3, "Reconnect to broker\n");
+      mqttClient.connect(broker, port);
+    }
   }
 }
 
@@ -502,74 +501,6 @@ int connectWifi(bool firstConnect) {
   return success;
 }
 
-
-
-/*****************************************************************
-/* send data to thingspeak                                         *
-/*****************************************************************/
-void sendData(const char* data_thingspeak, const IPAddress& host, const char* apikey, const int httpPort, const char* url) {
-  if(WiFi.status()!=WL_CONNECTED) {
-    DEBUG_OUT(DEBUG_ERROR, "Send data failed, no Wifi connection\n");
-    return;
-  }
-
-  char data_thingspeak_send[35+strlen(data_thingspeak)+strlen(apikey)];
-  sprintf(data_thingspeak_send, "{\"write_api_key\":\"%s\",\"updates\":%s}", apikey, data_thingspeak); 
-
-
-  unsigned long start_send=micros();
-  DEBUG_OUT(2, "Start connecting to %s\n", host.toString().c_str());
-
-  char request_head[170];
-
-  sprintf(request_head,
-  "POST %s HTTP/1.1\r\n"
-  "HOST: %s\r\n"
-  "Content-Type: application/json\r\n"
-  "Content-Length: %d\r\n"
-  "Connection: close\r\n\r\n",
-  url, host.toString().c_str(), strlen(data_thingspeak_send));
-
-  WiFiClient client;
-
-  client.setNoDelay(true);
-  client.setTimeout(20000);
-
-  if (!client.connect(host, httpPort)) {
-    DEBUG_OUT(1, "Connection failed!\n");
-    return;
-  }
-
-  DEBUG_OUT(2, "Requesting URL: %s\n", url);
-  DEBUG_OUT(3, "Request header:\n%s\n", request_head);
-  DEBUG_OUT(3, "Sending data:\n%s\n", data_thingspeak_send);
-
-  client.print(request_head);
-
-  client.println(data_thingspeak_send);
-
-  delay(10);
-
-  // Read reply from server and print them
-  DEBUG_OUT(2, "Reply: ");
-  while(!client.available()){
-    delay(100);
-    DEBUG_OUT(2, ".");
-  }
-  // Read all the lines of the reply from server and print them to Serial
-  DEBUG_OUT(2, "\n");
-  while(client.available()){
-    char c = client.read();
-    DEBUG_OUT(3, "%c", c);
-  }
-  DEBUG_OUT(2, "End connection\n");
-  DEBUG_OUT(2, "Time for sending data (microseconds): %lu\n", micros()-start_send);
-  wdt_reset(); // nodemcu is alive
-  yield();
-
-}
-
-
 const char htmlTemplate[] PROGMEM = "<!DOCTYPE html>\n\
 <html>\n\
 <head>\n\
@@ -592,8 +523,6 @@ const char htmlTemplate[] PROGMEM = "<!DOCTYPE html>\n\
 <tr><td>Current injection</td><td class='r'>%.0f&nbsp;W</td></tr>\n\
 <tr><td>15 min consumption</td><td class='r'>%.3f&nbsp;kWh</td></tr>\n\
 <tr><td colspan='2'>&nbsp;</td></tr>\n\
-<tr><td>Gas timestamp</td><td class='r'>%s</td></tr>\n\
-<tr><td>Gas consumption</td><td class='r'>%.4f&nbsp;m3</td></tr>\n\
 <tr><td colspan='2'>&nbsp;</td></tr>\n\
 <tr><td>Phase 1 voltage</td><td class='r'>%.1f&nbsp;V</td></tr>\n\
 <tr><td>Phase 2 voltage</td><td class='r'>%.1f&nbsp;V</td></tr>\n\
@@ -606,7 +535,6 @@ const char htmlTemplate[] PROGMEM = "<!DOCTYPE html>\n\
 <tr><td>Total off peak consumption</td><td class='r'>%.3f&nbsp;kWh</td></tr>\n\
 <tr><td>Total peak injection</td><td class='r'>%.3f&nbsp;kWh</td></tr>\n\
 <tr><td>Total off peak injection</td><td class='r'>%.3f&nbsp;kWh</td></tr>\n\
-<tr><td>Total gas consumption</td><td class='r'>%.4f&nbsp;m3</td></tr>\n\
 <tr><td colspan='2'>&nbsp;</td></tr>\n\
 <tr><td>Uptime</td><td class='r'>%lud&nbsp;%uh&nbsp;%um&nbsp;%us</td></tr>\n\
 <tr><td>Failed Wifi connection count</td><td class='r'>%u</td></tr>\n\
@@ -618,11 +546,9 @@ const char htmlTemplate[] PROGMEM = "<!DOCTYPE html>\n\
 void serveHtmlPage() {
   char timestampStr[21]="-";
   if(currentData.validTimestamp) strftime(timestampStr, 21, "%F %T", &currentData.timestamp); 
-  char gasTimestampStr[21]="-";
-  if(currentData.validGasTimestamp) strftime(gasTimestampStr, 21, "%F %T", &currentData.gasTimestamp); 
 
   double consumption15=-1.0;
-  if(referenceData15.isValid(false)) {
+  if(referenceData15.isValid()) {
     consumption15=currentData.isPeak?currentData.peakConsumption-referenceData15.peakConsumption:currentData.offPeakConsumption-referenceData15.offPeakConsumption;
   }
 
@@ -641,12 +567,11 @@ void serveHtmlPage() {
   currentData.peakInjection>=0.0?currentData.peakInjection-referenceData.peakInjection:-1.0, currentData.offPeakInjection>=0.0?currentData.offPeakInjection-referenceData.offPeakInjection:-1.0,
   currentData.currentConsumption>=0.0?currentData.currentConsumption*1000.0:-1.0, currentData.currentInjection>=0.0?currentData.currentInjection*1000.0:-1.0, 
   consumption15,
-  gasTimestampStr, currentData.gasConsumption>=0.0?currentData.gasConsumption-referenceData.gasConsumption:-1.0,
   currentData.phase1Voltage, currentData.phase2Voltage, currentData.phase3Voltage,
   currentData.phase1Current, currentData.phase2Current, currentData.phase3Current,
   currentData.peakConsumption, currentData.offPeakConsumption,
   currentData.peakInjection, currentData.offPeakInjection,
-  currentData.gasConsumption, uptimeDays, uptimeHours, uptimeMins, uptimeSecs, failedWifi, failedMeterConnect);
+  uptimeDays, uptimeHours, uptimeMins, uptimeSecs, failedWifi, failedMeterConnect);
   
   webServer.send(200, FPSTR("text/html; charset=utf-8"), pageContent);
   delete[] pageContent;

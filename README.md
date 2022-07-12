@@ -2,6 +2,6 @@
 
 Code and electric design to read belgian electric meter
 
-This is a work in progress. The code was not tested yet.
-
 Inpired from [Instructable](https://www.instructables.com/Read-Electricity-and-Gas-Meter-BelgianDutch-and-Up/)
+
+It reads electric measurement from P1 port and send to in MQTT to a local broker.
